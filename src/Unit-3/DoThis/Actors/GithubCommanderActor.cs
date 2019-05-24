@@ -46,7 +46,8 @@ namespace GithubActors.Actors
 
         private IActorRef _coordinator;
         private IActorRef _canAcceptJobSender;
-		public IStash Stash { get; set; }
+        private RepoKey _repoJob;
+        public IStash Stash { get; set; }
 
 		private int pendingJobReplies;
 
@@ -55,24 +56,27 @@ namespace GithubActors.Actors
 			Ready();
 		}
 
-		private void Ready()
-		{
-			Receive<CanAcceptJob>(job =>
-			{
-				_coordinator.Tell(job);
+        private void Ready()
+        {
+            Receive<CanAcceptJob>(job =>
+            {
+                _coordinator.Tell(job);
+                _repoJob = job.Repo;
+                BecomeAsking();
+            });
+        }
+        private void BecomeAsking()
+        {
+            _canAcceptJobSender = Sender;
+            // block, but ask the router for the number of routees. Avoids magic numbers.
+            pendingJobReplies = _coordinator.Ask<Routees>(new GetRoutees())
+              .Result.Members.Count();
+            Become(Asking);
 
-				BecomeAsking();
-			});
-		}
-
-		private void BecomeAsking()
-		{
-			_canAcceptJobSender = Sender;
-			pendingJobReplies = 3; //the number of routees
-			Become(Asking);
-		}
-
-		private void Asking()
+            // send ourselves a ReceiveTimeout message if no message within 3 seconds
+            Context.SetReceiveTimeout(TimeSpan.FromSeconds(3));
+        }
+        private void Asking()
 		{
 			// stash any subsequent requests
 			Receive<CanAcceptJob>(job => Stash.Stash());
@@ -100,34 +104,35 @@ namespace GithubActors.Actors
 
 				BecomeReady();
 			});
-		}
 
-		private void BecomeReady()
-		{
-			Become(Ready);
-			Stash.UnstashAll();
-		}
-		protected override void PreStart()
-		{
-			// create three GithubCoordinatorActor instances
-			var c1 = Context.ActorOf(Props.Create(() => new GithubCoordinatorActor()),
-				ActorPaths.GithubCoordinatorActor.Name + "1");
-			var c2 = Context.ActorOf(Props.Create(() => new GithubCoordinatorActor()),
-				ActorPaths.GithubCoordinatorActor.Name + "2");
-			var c3 = Context.ActorOf(Props.Create(() => new GithubCoordinatorActor()),
-				ActorPaths.GithubCoordinatorActor.Name + "3");
+            Receive<ReceiveTimeout>(timeout =>
+            {
+                _canAcceptJobSender.Tell(new UnableToAcceptJob(_repoJob));
+                BecomeReady();
+            });
+        }
 
-			// create a broadcast router who will ask all of them 
-			// if they're available for work
-			_coordinator =
-				Context.ActorOf(Props.Empty.WithRouter(
-					new BroadcastGroup(ActorPaths.GithubCoordinatorActor.Path + "1",
-					ActorPaths.GithubCoordinatorActor.Path + "2",
-					ActorPaths.GithubCoordinatorActor.Path + "3")));
-			base.PreStart();
-		}
+        private void BecomeReady()
+        {
+            Become(Ready);
+            Stash.UnstashAll();
 
-		protected override void PreRestart(Exception reason, object message)
+            // cancel ReceiveTimeout
+            Context.SetReceiveTimeout(null);
+        }
+
+        protected override void PreStart()
+        {
+            // create a broadcast router who will ask all 
+            // of them if they're available for work
+            _coordinator =
+                Context.ActorOf(Props.Create(() => new GithubCoordinatorActor())
+                  .WithRouter(FromConfig.Instance),
+                  ActorPaths.GithubCoordinatorActor.Name);
+            base.PreStart();
+        }
+
+        protected override void PreRestart(Exception reason, object message)
         {
             //kill off the old coordinator so we can recreate it from scratch
             _coordinator.Tell(PoisonPill.Instance);
